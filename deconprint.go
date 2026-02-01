@@ -13,13 +13,13 @@ type event struct {
 }
 
 type Printer struct {
-	output   io.Writer
-	delay    time.Duration
-	inbox    []event
-	inboxMu  sync.Mutex
-	wake     chan struct{}
-	nextID   int
-	mu       sync.Mutex
+	output  io.Writer
+	delay   time.Duration
+	inbox   []event
+	inboxMu sync.Mutex
+	wake    chan struct{}
+	nextID  int
+	mu      sync.Mutex
 }
 
 func New(output io.Writer, lockoutDelay time.Duration) *Printer {
@@ -68,21 +68,46 @@ func (p *Printer) enqueue(e event) {
 
 func (p *Printer) arbiter() {
 	var owner int = -1
-	var queue []event
+	pending := make(map[int][]event)
+	var waiting []int
+	closedPipes := make(map[int]bool)
 	var timer *time.Timer
 	var timerCh <-chan time.Time
 
-	flushNext := func() {
-		if len(queue) == 0 {
-			owner = -1
+	inWaiting := func(pipeID int) bool {
+		for _, w := range waiting {
+			if w == pipeID {
+				return true
+			}
+		}
+		return false
+	}
+
+	flushPipe := func(pipeID int) {
+		for _, e := range pending[pipeID] {
+			p.output.Write(e.data)
+		}
+		delete(pending, pipeID)
+	}
+
+	handOff := func() {
+		owner = -1
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+		}
+		for len(waiting) > 0 {
+			j := waiting[0]
+			waiting = waiting[1:]
+			flushPipe(j)
+			if closedPipes[j] {
+				continue
+			}
+			owner = j
+			timer = time.NewTimer(p.delay)
+			timerCh = timer.C
 			return
 		}
-		e := queue[0]
-		queue = queue[1:]
-		owner = e.pipeID
-		p.output.Write(e.data)
-		timer = time.NewTimer(p.delay)
-		timerCh = timer.C
 	}
 
 	for {
@@ -93,33 +118,28 @@ func (p *Printer) arbiter() {
 				continue
 			}
 			if e.closed {
+				closedPipes[e.pipeID] = true
 				if owner == e.pipeID {
-					if timer != nil {
-						timer.Stop()
-						timer = nil
-					}
-					owner = -1
-					flushNext()
+					handOff()
 				}
 				continue
 			}
-			switch owner {
-			case -1:
-				owner = e.pipeID
-				p.output.Write(e.data)
-				timer = time.NewTimer(p.delay)
-				timerCh = timer.C
-			case e.pipeID:
+			if owner == e.pipeID {
 				p.output.Write(e.data)
 				timer.Stop()
 				timer.Reset(p.delay)
-			default:
-				queue = append(queue, e)
+			} else {
+				pending[e.pipeID] = append(pending[e.pipeID], e)
+				if !inWaiting(e.pipeID) {
+					waiting = append(waiting, e.pipeID)
+				}
+				if owner == -1 {
+					handOff()
+				}
 			}
 		case <-timerCh:
 			timer, timerCh = nil, nil
-			owner = -1
-			flushNext()
+			handOff()
 		}
 	}
 }
