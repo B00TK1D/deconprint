@@ -110,32 +110,38 @@ func (p *Printer) arbiter() {
 		}
 	}
 
+	process := func(e event) {
+		if e.closed {
+			closedPipes[e.pipeID] = true
+			if owner == e.pipeID {
+				handOff()
+			}
+			return
+		}
+		if owner == e.pipeID {
+			p.output.Write(e.data)
+			timer.Stop()
+			timer.Reset(p.delay)
+		} else {
+			pending[e.pipeID] = append(pending[e.pipeID], e)
+			if !inWaiting(e.pipeID) {
+				waiting = append(waiting, e.pipeID)
+			}
+			if owner == -1 {
+				handOff()
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-p.wake:
-			e, ok := p.dequeue()
-			if !ok {
-				continue
-			}
-			if e.closed {
-				closedPipes[e.pipeID] = true
-				if owner == e.pipeID {
-					handOff()
+			for {
+				e, ok := p.dequeue()
+				if !ok {
+					break
 				}
-				continue
-			}
-			if owner == e.pipeID {
-				p.output.Write(e.data)
-				timer.Stop()
-				timer.Reset(p.delay)
-			} else {
-				pending[e.pipeID] = append(pending[e.pipeID], e)
-				if !inWaiting(e.pipeID) {
-					waiting = append(waiting, e.pipeID)
-				}
-				if owner == -1 {
-					handOff()
-				}
+				process(e)
 			}
 		case <-timerCh:
 			timer, timerCh = nil, nil
