@@ -13,18 +13,20 @@ type event struct {
 }
 
 type Printer struct {
-	output io.Writer
-	delay  time.Duration
-	ev     chan event
-	nextID int
-	mu     sync.Mutex
+	output   io.Writer
+	delay    time.Duration
+	inbox    []event
+	inboxMu  sync.Mutex
+	wake     chan struct{}
+	nextID   int
+	mu       sync.Mutex
 }
 
 func New(output io.Writer, lockoutDelay time.Duration) *Printer {
 	p := &Printer{
 		output: output,
 		delay:  lockoutDelay,
-		ev:     make(chan event, 64),
+		wake:   make(chan struct{}, 1),
 	}
 	go p.arbiter()
 	return p
@@ -45,12 +47,22 @@ func (p *Printer) readPipe(pipeID int, r io.Reader) {
 		if n > 0 {
 			cp := make([]byte, n)
 			copy(cp, buf[:n])
-			p.ev <- event{pipeID: pipeID, data: cp}
+			p.enqueue(event{pipeID: pipeID, data: cp})
 		}
 		if err != nil {
-			p.ev <- event{pipeID: pipeID, closed: true}
+			p.enqueue(event{pipeID: pipeID, closed: true})
 			return
 		}
+	}
+}
+
+func (p *Printer) enqueue(e event) {
+	p.inboxMu.Lock()
+	p.inbox = append(p.inbox, e)
+	p.inboxMu.Unlock()
+	select {
+	case p.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -75,7 +87,11 @@ func (p *Printer) arbiter() {
 
 	for {
 		select {
-		case e := <-p.ev:
+		case <-p.wake:
+			e, ok := p.dequeue()
+			if !ok {
+				continue
+			}
 			if e.closed {
 				if owner == e.pipeID {
 					if timer != nil {
@@ -106,4 +122,21 @@ func (p *Printer) arbiter() {
 			flushNext()
 		}
 	}
+}
+
+func (p *Printer) dequeue() (event, bool) {
+	p.inboxMu.Lock()
+	defer p.inboxMu.Unlock()
+	if len(p.inbox) == 0 {
+		return event{}, false
+	}
+	e := p.inbox[0]
+	p.inbox = p.inbox[1:]
+	if len(p.inbox) > 0 {
+		select {
+		case p.wake <- struct{}{}:
+		default:
+		}
+	}
+	return e, true
 }
