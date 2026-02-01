@@ -19,14 +19,12 @@ func main() {
 	stderr2, _ := cmd2.StderrPipe()
 	p.Add(stdout1)
 	p.Add(stderr2)
-
 	if err := cmd1.Start(); err != nil {
 		os.Exit(1)
 	}
 	if err := cmd2.Start(); err != nil {
 		os.Exit(1)
 	}
-	_ = p.Run()
 	_ = cmd1.Wait()
 	_ = cmd2.Wait()
 }

@@ -15,48 +15,46 @@ type event struct {
 type Printer struct {
 	output io.Writer
 	delay  time.Duration
-	pipes  []io.Reader
+	ev     chan event
+	nextID int
+	mu     sync.Mutex
 }
 
 func New(output io.Writer, lockoutDelay time.Duration) *Printer {
-	return &Printer{output: output, delay: lockoutDelay}
+	p := &Printer{
+		output: output,
+		delay:  lockoutDelay,
+		ev:     make(chan event, 64),
+	}
+	go p.arbiter()
+	return p
 }
 
 func (p *Printer) Add(r io.Reader) {
-	p.pipes = append(p.pipes, r)
+	p.mu.Lock()
+	pipeID := p.nextID
+	p.nextID++
+	p.mu.Unlock()
+	go p.readPipe(pipeID, r)
 }
 
-func (p *Printer) Run() error {
-	n := len(p.pipes)
-	if n == 0 {
-		return nil
+func (p *Printer) readPipe(pipeID int, r io.Reader) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			cp := make([]byte, n)
+			copy(cp, buf[:n])
+			p.ev <- event{pipeID: pipeID, data: cp}
+		}
+		if err != nil {
+			p.ev <- event{pipeID: pipeID, closed: true}
+			return
+		}
 	}
-	ev := make(chan event, n*2)
-	var wg sync.WaitGroup
-	for i, r := range p.pipes {
-		wg.Add(1)
-		go func(pipeID int, rd io.Reader) {
-			defer wg.Done()
-			buf := make([]byte, 4096)
-			for {
-				n, err := rd.Read(buf)
-				if n > 0 {
-					cp := make([]byte, n)
-					copy(cp, buf[:n])
-					ev <- event{pipeID: pipeID, data: cp}
-				}
-				if err != nil {
-					ev <- event{pipeID: pipeID, closed: true}
-					return
-				}
-			}
-		}(i, r)
-	}
-	go func() {
-		wg.Wait()
-		close(ev)
-	}()
+}
 
+func (p *Printer) arbiter() {
 	var owner int = -1
 	var queue []event
 	var timer *time.Timer
@@ -75,24 +73,9 @@ func (p *Printer) Run() error {
 		timerCh = timer.C
 	}
 
-	drainQueue := func() {
-		for _, e := range queue {
-			if !e.closed && len(e.data) > 0 {
-				p.output.Write(e.data)
-			}
-		}
-	}
-
 	for {
 		select {
-		case e, ok := <-ev:
-			if !ok {
-				if timer != nil {
-					timer.Stop()
-				}
-				drainQueue()
-				return nil
-			}
+		case e := <-p.ev:
 			if e.closed {
 				if owner == e.pipeID {
 					if timer != nil {
