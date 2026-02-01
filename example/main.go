@@ -3,7 +3,7 @@
 package main
 
 import (
-	"deconprint"
+	"github.com/B00TK1D/deconprint"
 	"os"
 	"os/exec"
 	"time"
