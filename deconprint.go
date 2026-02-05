@@ -2,6 +2,7 @@ package deconprint
 
 import (
 	"io"
+	"slices"
 	"sync"
 	"time"
 )
@@ -13,23 +14,47 @@ type event struct {
 }
 
 type Printer struct {
-	output  io.Writer
-	delay   time.Duration
-	inbox   []event
-	inboxMu sync.Mutex
-	wake    chan struct{}
-	nextID  int
-	mu      sync.Mutex
+	output   io.Writer
+	delay    time.Duration
+	inbox    []event
+	inboxMu  sync.Mutex
+	wake     chan struct{}
+	resumeCh chan struct{}
+	paused   bool
+	pauseMu  sync.Mutex
+	nextID   int
+	mu       sync.Mutex
 }
 
 func New(output io.Writer, lockoutDelay time.Duration) *Printer {
 	p := &Printer{
-		output: output,
-		delay:  lockoutDelay,
-		wake:   make(chan struct{}, 1),
+		output:   output,
+		delay:    lockoutDelay,
+		wake:     make(chan struct{}, 1),
+		resumeCh: make(chan struct{}),
 	}
 	go p.arbiter()
 	return p
+}
+
+func (p *Printer) Pause() {
+	p.pauseMu.Lock()
+	p.paused = true
+	p.pauseMu.Unlock()
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Printer) Resume() {
+	p.pauseMu.Lock()
+	p.paused = false
+	p.pauseMu.Unlock()
+	select {
+	case p.resumeCh <- struct{}{}:
+	default:
+	}
 }
 
 func (p *Printer) Add(r io.Reader) {
@@ -75,12 +100,7 @@ func (p *Printer) arbiter() {
 	var timerCh <-chan time.Time
 
 	inWaiting := func(pipeID int) bool {
-		for _, w := range waiting {
-			if w == pipeID {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(waiting, pipeID)
 	}
 
 	flushPipe := func(pipeID int) {
@@ -137,6 +157,13 @@ func (p *Printer) arbiter() {
 		select {
 		case <-p.wake:
 			for {
+				p.pauseMu.Lock()
+				if p.paused {
+					p.pauseMu.Unlock()
+					<-p.resumeCh
+					continue
+				}
+				p.pauseMu.Unlock()
 				e, ok := p.dequeue()
 				if !ok {
 					break
